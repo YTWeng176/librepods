@@ -114,6 +114,8 @@ android {
     productFlavors {
         create("foss") {
             dimension = "env"
+            applicationIdSuffix = ".personal"
+            versionNameSuffix = "-personal.1"
             buildConfigField("Boolean", "PLAY_BUILD", "false")
         }
         create("play") {

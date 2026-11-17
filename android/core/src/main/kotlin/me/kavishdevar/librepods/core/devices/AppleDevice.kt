@@ -9,6 +9,8 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -117,6 +119,8 @@ class AppleDevice(
         _microphoneFrames.emit(frame)
     }
 
+    private val connectionScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     val aacp = AACPManager(this)
     val att = ATTManager(this)
 
@@ -138,46 +142,38 @@ class AppleDevice(
         }
     }
 
-    override fun connect(): Boolean {
-        _connectionState.update {
-            ConnectionState.CONNECTING
-        }
-
-        val success = aacp.connect() // && att.connect()
-
-        CoroutineScope(Dispatchers.IO).launch {
-            _state.update {
-                it.copy(
-                    loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
-                    transparencyData = readATTCharacteristic(ATTHandle.TRANSPARENCY)?: byteArrayOf(),
-                    hearingAidData = readATTCharacteristic(ATTHandle.HEARING_AID)?: byteArrayOf()
-                )
+    override fun connect(): Boolean = aacp.connect(
+        onConnecting = {
+            connectionScope.coroutineContext.cancelChildren()
+            _connectionState.value = ConnectionState.CONNECTING
+        },
+        onConnected = {
+            _connectionState.value = ConnectionState.CONNECTED
+            _connectionNumber.update { it + 1 }
+            connectionScope.launch {
+                _state.update {
+                    it.copy(
+                        loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
+                        transparencyData = readATTCharacteristic(ATTHandle.TRANSPARENCY) ?: byteArrayOf(),
+                        hearingAidData = readATTCharacteristic(ATTHandle.HEARING_AID) ?: byteArrayOf()
+                    )
+                }
             }
+        },
+        onDisconnected = {
+            // Called only by the current socket's owner, including EOF and open
+            // failure. Never acquire a second device monitor from this callback.
+            connectionScope.coroutineContext.cancelChildren()
+            gestureDetector.stopDetection()
+            _state.update { it.copy(lastDisconnected = System.currentTimeMillis()) }
+            _connectionState.value = ConnectionState.DISCONNECTED
         }
+    )
 
-        _connectionState.update {
-            if (success) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
-        }
-        _connectionNumber.update {
-            it + 1
-        }
-
-        return success
-    }
+    fun closeControlConnection() = aacp.disconnect()
 
     override fun disconnect() {
-        _state.update {
-            it.copy(
-                lastDisconnected = System.currentTimeMillis()
-            )
-        }
-        _connectionState.update {
-            ConnectionState.DISCONNECTING
-        }
-
-        aacp.disconnect()
-//        att.disconnect()
-
+        closeControlConnection()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN) {
             try {
                 bluetoothDevice.disconnect()
@@ -186,9 +182,6 @@ class AppleDevice(
             }
         }
 
-        _connectionState.update {
-            ConnectionState.DISCONNECTED
-        }
     }
 
     fun setControlCommand(identifier: ControlCommandIdentifier, value: ByteArray): Boolean = aacp.sendControlCommand(identifier.value, value)
@@ -210,7 +203,7 @@ class AppleDevice(
 
     // can't use att notifications; keeping ATT connected causes airpods to disconnect every few seconds for some reason
     // we will poll the characteristic every 1 seconds instead.
-    fun observeATTCharacteristic(handle: ATTHandle): Job = CoroutineScope(Dispatchers.IO).launch {
+    fun observeATTCharacteristic(handle: ATTHandle): Job = connectionScope.launch {
         while (true) {
             val value = readATTCharacteristic(handle)
             if (value != null) {

@@ -1,3 +1,10 @@
+> **非官方个人测试版 / LibrePods Personal**
+>
+> 本分支基于 2.0 Alpha 4，面向无 Root 的 Android 自用测试，包含连接生命周期、对话感知、中文与弹窗修补。
+> [个人版说明、构建与真机验收](docs/PERSONAL.md) · [下载安装包](https://github.com/YTWeng176/librepods/releases)
+>
+> 包名与官方版独立；测试时请只运行一个 LibrePods 后台服务。原项目说明与许可证保留如下。
+
 > [!WARNING]
 > librepods.org is not an official website of the LibrePods project. It inaccurately claims to be the official website of the project by claiming copyrights and using the LibrePods logo in the footer. And at the same time, they say that the project is not affiliated with the LibrePods project or its developers.
 > 

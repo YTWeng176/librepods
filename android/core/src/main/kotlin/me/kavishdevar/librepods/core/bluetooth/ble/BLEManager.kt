@@ -11,10 +11,6 @@ import android.content.Context
 import android.os.SystemClock
 import android.util.Log
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
 import me.kavishdevar.librepods.core.bluetooth.MacAddress
 import me.kavishdevar.librepods.core.bluetooth.verifyRPA
 import me.kavishdevar.librepods.core.data.apple.AccessoryState
@@ -31,9 +27,11 @@ import me.kavishdevar.librepods.core.devices.DeviceComponent
 import me.kavishdevar.librepods.core.devices.DeviceComponentState
 import me.kavishdevar.librepods.core.devices.format
 import me.kavishdevar.librepods.core.devices.hasSameBatteryState
+import me.kavishdevar.librepods.core.utils.ScanLifecycle
+import me.kavishdevar.librepods.core.utils.AdvertisementCache
+import java.util.concurrent.ConcurrentHashMap
 import javax.crypto.Cipher
 import javax.crypto.spec.SecretKeySpec
-import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 @SuppressLint("MissingPermission")
@@ -58,42 +56,33 @@ class BLEManager(
     }
 
     private val rpasByPublicMac = mutableMapOf<MacAddress, MutableSet<MacAddress>>()
-    private val caseAddressByPublicMac = mutableMapOf<MacAddress, MutableSet<MacAddress>>()
     private val rejectedRandomMac = mutableSetOf<MacAddress>()
 
-    private var flushJob: Job? = null
-
-    private val lastSeenMap = mutableMapOf<MacAddress, Long>()
-    private var connectionTimeoutJob: Job? = null
-
-    init {
-        startTimeoutChecker()
-    }
-
+    private val lastSeenMap = ConcurrentHashMap<MacAddress, Long>()
     private val timeoutDuration = 5.seconds
+    private val caseAdvertisements = AdvertisementCache<Pair<MacAddress, ByteArray>>(128)
 
-    private fun startTimeoutChecker() {
-        connectionTimeoutJob = scope.launch {
-            while (isActive) {
-                delay(timeoutDuration / 2)
-                val currentTime = System.currentTimeMillis()
+    private val lifecycle = ScanLifecycle(
+        scope = scope,
+        startScan = ::startScan,
+        stopScan = {
+            try { bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback) }
+            catch (e: Exception) { Log.e(TAG, "error stopping BLE scan", e) }
+        },
+        flush = {
+            try { bluetoothAdapter?.bluetoothLeScanner?.flushPendingScanResults(scanCallback) }
+            catch (e: Exception) { Log.e(TAG, "error flushing pending scan results", e) }
+        },
+        checkTimeout = ::checkTimeout
+    )
 
-                getDevices().values.forEach { device ->
-                    val lastSeen = lastSeenMap[device.macAddress] ?: 0L
-                    if (lastSeen > 0 && currentTime - lastSeen > timeoutDuration.inWholeMilliseconds) {
-                        when (device) {
-                            is AppleDevice -> {
-                                if (device.connectionState.value == ConnectionState.AVAILABLE) {
-                                    Log.i(
-                                        TAG,
-                                        "Device ${device.macAddress.toRedactedString()} timed out (no packets received). setting to DISCONNECTED"
-                                    )
-                                    device.updateConnectionState(ConnectionState.DISCONNECTED)
-                                }
-                            }
-                        }
-                    }
-                }
+    private fun checkTimeout() {
+        val now = SystemClock.elapsedRealtime()
+        getDevices().values.forEach { device ->
+            val lastSeen = lastSeenMap[device.macAddress] ?: return@forEach
+            if (now - lastSeen > timeoutDuration.inWholeMilliseconds &&
+                device is AppleDevice && device.connectionState.value == ConnectionState.AVAILABLE) {
+                device.updateConnectionState(ConnectionState.DISCONNECTED)
             }
         }
     }
@@ -108,11 +97,13 @@ class BLEManager(
         }
     }
 
-    fun start() {
+    fun start() = lifecycle.start(reportDelay)
+
+    private fun startScan() {
         val bleScanner = bluetoothAdapter?.bluetoothLeScanner
         if (bleScanner == null) {
             Log.w(TAG, "error starting BLE scanner: not available")
-            return
+            throw IllegalStateException("BLE scanner not available")
         }
 
         val scanSettings = ScanSettings.Builder()
@@ -143,47 +134,24 @@ class BLEManager(
             bleScanner.startScan(listOf(budsFilter, chargingCaseFilter), scanSettings, scanCallback)
             Log.i(TAG, "started BLE scan: mode=${scanMode}, delay=${reportDelay}")
         } catch (e: Exception) {
-            if (e.message?.contains("too frequently") == true) {
-                scope.launch {
-                    delay(5.seconds)
-                    start()
-                }
-            } else {
-                Log.e(TAG, "error starting BLE scan", e)
-            }
-        }
-
-        flushJob = scope.launch {
-            while (isActive) {
-                delay(reportDelay.milliseconds)
-                try {
-                    bleScanner.flushPendingScanResults(scanCallback)
-                } catch (e: Exception) {
-                    Log.e(TAG, "error flushing pending scan results", e)
-                }
-            }
+            Log.e(TAG, "error starting BLE scan", e)
+            throw e
         }
     }
 
-    fun stop() {
-        flushJob?.cancel()
-        connectionTimeoutJob?.cancel()
-        val bleScanner = bluetoothAdapter?.bluetoothLeScanner ?: return
-        try {
-            bleScanner.stopScan(scanCallback)
-            Log.i(TAG, "stopped BLE scan")
-        } catch (e: Exception) {
-            Log.e(TAG, "error stopping BLE scan", e)
-        }
-    }
+    fun stop() = lifecycle.stop()
 
+    @Synchronized
     fun updateIrkMap(irkMap: Map<MacAddress, ByteArray>) {
-        this.irkMap = irkMap
+        this.irkMap = irkMap.mapValues { it.value.copyOf() }
+        rpasByPublicMac.clear()
         rejectedRandomMac.clear()
     }
 
+    @Synchronized
     fun updateEncKeyMap(encKeyMap: Map<MacAddress, ByteArray>) {
-        this.encKeyMap = encKeyMap
+        this.encKeyMap = encKeyMap.mapValues { it.value.copyOf() }
+        caseAdvertisements.clear()
         rejectedRandomMac.clear()
     }
 
@@ -195,14 +163,13 @@ class BLEManager(
 
     fun updateReportDelay(reportDelay: Long) {
         stop()
-        this.reportDelay = reportDelay
+        this.reportDelay = reportDelay.coerceAtLeast(0)
         start()
     }
 
+    @Synchronized
     private fun processScanResult(result: ScanResult) {
         val macAddress = MacAddress(result.device.address)
-
-        if (rejectedRandomMac.contains(macAddress)) return
 
         val manufacturerData = result.scanRecord?.getManufacturerSpecificData(0x004C)?: return
 
@@ -211,13 +178,19 @@ class BLEManager(
             return
         }
 
+        if (rejectedRandomMac.contains(macAddress)) return
         val deviceMac = resolveDeviceMac(macAddress)
         if (deviceMac != null) {
             handleResolvedAppleBudsAdvertisement(deviceMac, manufacturerData)
             return
         }
 
-        rejectedRandomMac.add(macAddress)
+        reject(macAddress)
+    }
+
+    private fun reject(mac: MacAddress) {
+        rejectedRandomMac.add(mac)
+        if (rejectedRandomMac.size > 256) rejectedRandomMac.remove(rejectedRandomMac.first())
     }
 
     private fun resolveDeviceMac(bleMac: MacAddress): MacAddress? {
@@ -235,13 +208,15 @@ class BLEManager(
                 if (verifyRPA(bleMac.value, irk)) {
                     Log.i(TAG, "new RPA verified for device ${macAddress.toRedactedString()}")
                     deviceMac = macAddress
-                    rpasByPublicMac.getOrPut(macAddress) { mutableSetOf() }.add(bleMac)
+                    val addresses = rpasByPublicMac.getOrPut(macAddress) { linkedSetOf() }
+                    addresses.add(bleMac)
+                    if (addresses.size > 16) addresses.remove(addresses.first())
                 }
             }
         }
 
         if (deviceMac == null) {
-            rejectedRandomMac.add(bleMac)
+            reject(bleMac)
         }
 
         return devices[deviceMac]?.macAddress
@@ -252,7 +227,8 @@ class BLEManager(
         publicMac: MacAddress,
         data: ByteArray
     ) {
-        lastSeenMap[publicMac] = System.currentTimeMillis()
+        if (data.size < 16) return
+        lastSeenMap[publicMac] = SystemClock.elapsedRealtime()
         val encrypted = data.copyOfRange(data.size - 16, data.size)
 
         val plaintext = try {
@@ -415,28 +391,22 @@ class BLEManager(
             if (kind == 0x07 && length >= 17 && data[payloadStart] == 0x06.toByte()) {
                 val encrypted = data.copyOfRange(payloadStart + 1, payloadStart + 17)
 
-                for ((publicMac, key) in encKeyMap.toMap()) {
-                    val plaintext = try {
-                        @SuppressLint("GetInstance")
-                        val cipher = Cipher.getInstance("AES/ECB/NoPadding")
-                        cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
-                        cipher.doFinal(encrypted)
-                    } catch (_: Exception) {
-                        continue
+                val resolved = caseAdvertisements.resolve(encrypted) {
+                    encKeyMap.entries.firstNotNullOfOrNull { (publicMac, key) ->
+                        val plaintext = try {
+                            @SuppressLint("GetInstance")
+                            val cipher = Cipher.getInstance("AES/ECB/NoPadding")
+                            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"))
+                            cipher.doFinal(encrypted)
+                        } catch (_: Exception) { null }
+                        plaintext?.takeIf(::isValidCasePlaintext)?.let { publicMac to it }
                     }
-
-                    if (!isValidCasePlaintext(plaintext)) continue
-
-                    val oldCaseMac = caseAddressByPublicMac[publicMac]?.firstOrNull()
-                    if (oldCaseMac != caseMac) {
-                        caseAddressByPublicMac[publicMac] = mutableSetOf(caseMac)
-                        if (oldCaseMac != null) {
-                            caseAddressByPublicMac[publicMac]?.add(oldCaseMac)
-                        }
-                    }
-
-                    rejectedRandomMac.remove(caseMac)
-
+                }
+                // Even an unmatched case packet is handled: a new ciphertext must be
+                // retried, rather than rejecting this random address permanently.
+                if (resolved == null) return true
+                val (publicMac, plaintext) = resolved
+                rejectedRandomMac.remove(caseMac)
                     val batteries = buildSet {
                         for ((component, index) in listOf(
                             BatteryComponent.CASE to 3,
@@ -458,7 +428,7 @@ class BLEManager(
                     }
 
                     if (batteries.isNotEmpty()) {
-                        val device = (getDevices()[publicMac] as? AppleDevice) ?: continue
+                        val device = (getDevices()[publicMac] as? AppleDevice) ?: return true
                         val previousState = device.state.value
 
                         val updates = batteries.associateBy { it.component }
@@ -478,8 +448,7 @@ class BLEManager(
                         }
                     }
 
-                    return true
-                }
+                return true
             }
             offset = payloadEnd
         }

@@ -19,6 +19,7 @@
 package me.kavishdevar.librepods.core.utils
 
 import android.util.Log
+import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,8 +53,7 @@ class GestureDetector {
     private val horizontalBuffer = Collections.synchronizedList(ArrayList<Double>())
     private val verticalBuffer = Collections.synchronizedList(ArrayList<Double>())
 
-    private val horizontalAvgBuffer = Collections.synchronizedList(ArrayList<Double>())
-    private val verticalAvgBuffer = Collections.synchronizedList(ArrayList<Double>())
+    private val smoother = GestureSmoother()
 
     private var prevHorizontal: Double = 0.0
     private var prevVertical: Double = 0.0
@@ -84,10 +84,6 @@ class GestureDetector {
     private var significantMotion = false
     private var lastSignificantMotionTime = 0L
 
-    init {
-        while (horizontalAvgBuffer.size < 3) horizontalAvgBuffer.add(0.0)
-        while (verticalAvgBuffer.size < 3) verticalAvgBuffer.add(0.0)
-    }
 
     fun startDetection(acceleration: StateFlow<Acceleration>, callback: (Boolean) -> Unit): Boolean {
         if (isRunning) return false
@@ -176,8 +172,9 @@ class GestureDetector {
         prevHorizontal = horizontal.toDouble()
         prevVertical = vertical.toDouble()
 
-        val smoothHorizontal = applySmoothing(horizontal.toDouble(), horizontalAvgBuffer)
-        val smoothVertical = applySmoothing(vertical.toDouble(), verticalAvgBuffer)
+        val (smoothHorizontal, smoothVertical) = smoother.sample(
+            horizontal.toDouble(), vertical.toDouble(), SystemClock.elapsedRealtime()
+        )
 
         synchronized(horizontalBuffer) {
             horizontalBuffer.add(smoothHorizontal)
@@ -191,15 +188,6 @@ class GestureDetector {
 
         detectPeaksAndTroughs()
     }
-
-    private fun applySmoothing(newValue: Double, buffer: MutableList<Double>): Double {
-        synchronized(buffer) {
-            buffer.add(newValue)
-            if (buffer.size > 3) buffer.removeAt(0)
-            return buffer.average()
-        }
-    }
-
 
     private fun detectPeaksAndTroughs() {
         if (horizontalBuffer.size < 4 || verticalBuffer.size < 4) return
@@ -393,6 +381,7 @@ class GestureDetector {
     }
 
     private fun clearData() {
+        smoother.clear()
         horizontalBuffer.clear()
         verticalBuffer.clear()
         horizontalPeaks.clear()

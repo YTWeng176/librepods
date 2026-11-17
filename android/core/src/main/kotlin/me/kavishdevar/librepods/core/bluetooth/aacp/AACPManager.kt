@@ -61,6 +61,8 @@ import me.kavishdevar.librepods.core.devices.BatteryStatus
 import me.kavishdevar.librepods.core.devices.DeviceComponent
 import me.kavishdevar.librepods.core.devices.hasSameBatteryState
 import me.kavishdevar.librepods.core.utils.HeadTracking
+import me.kavishdevar.librepods.core.utils.SocketSession
+import me.kavishdevar.librepods.core.utils.readPackets
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.time.Clock
@@ -72,12 +74,13 @@ class AACPManager(private val device: AppleDevice) {
     private val macParts = device.macAddress.value.split(":")
     private val TAG = "AACPManager[${macParts[0]}:${macParts[1]}:${macParts[2]}]"
 
-    private var socket: BluetoothSocket? = null
+    private val session = SocketSession<BluetoothSocket>(CoroutineScope(Dispatchers.IO))
+    private val socket: BluetoothSocket? get() = session.resource
 
     private val rtBuddyManager = RTBuddyManager(::sendPacket)
 
-    private suspend fun sendDelayedInitPackets() {
-        socket?.let {
+    private suspend fun sendDelayedInitPackets(connectedSocket: BluetoothSocket) {
+        connectedSocket.let {
             while (!it.isConnected) {
                 Log.i(TAG, "waiting for connection...")
                 delay(500.milliseconds)
@@ -93,72 +96,46 @@ class AACPManager(private val device: AppleDevice) {
             sendCountryCode()
             delay(200.milliseconds)
             sendRequestMagicKeys((MagicKeyType.IRK.value + MagicKeyType.ENC_KEY.value).toByte())
-        } ?: run {
-            Log.e(TAG, "socket is null after creation")
         }
     }
 
-    fun connect(): Boolean {
-        if (socket != null && socket!!.isConnected) {
-            Log.i(TAG, "Already connected")
-            return true
-        }
-        try {
-            socket = device.createSocket(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"),  4097)
-        } catch (e: Exception) {
-            Log.e(TAG, "failed to create socket", e)
-            return false
-        }
-
-        socket?.let { socket ->
-            try {
-                Log.i(TAG, "connecting...")
-                socket.connect()
-            } catch (e: Exception) {
-                Log.e(TAG, "failed to connect", e)
-                return false
-            }
-
-            if (socket.isConnected) {
-                Log.i(TAG, "connected!")
-            }
-
-            CoroutineScope(Dispatchers.IO).launch {
-                sendDelayedInitPackets()
-                delay(3.seconds) // just android stuff ig
-                sendDelayedInitPackets()
-            }
-
-            CoroutineScope(Dispatchers.IO).launch {
-                Log.i(TAG, "starting to read data...")
-
-                while (socket.isConnected) {
+    fun connect(onConnecting: () -> Unit, onConnected: () -> Unit, onDisconnected: () -> Unit): Boolean {
+        return try {
+            session.connect(
+                create = {
+                    onConnecting()
+                    val opened = device.createSocket(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"), 4097)
                     try {
-                        val buffer = ByteArray(1024)
-                        val bytesRead = socket.inputStream.read(buffer)
-                        var data: ByteArray
-                        if (bytesRead > 0) {
-                            data = buffer.copyOfRange(0, bytesRead)
-                            try {
-                                processPacket(data)
-                            } catch (e: Exception) {
-                                Log.e(TAG, "Error processing received packet: ${e.message}")
-                                e.printStackTrace()
-                            }
-
-                        } else if (bytesRead == -1) {
-                            Log.i("AirPodsService", "socket closed (bytesRead = -1)")
-                        }
+                        opened.connect()
+                        opened
                     } catch (e: Exception) {
-                        Log.i(TAG, "Error reading data, we have probably disconnected.")
-                        e.printStackTrace()
+                        opened.close()
+                        throw e
                     }
+                },
+                initialize = { connectedSocket ->
+                    sendDelayedInitPackets(connectedSocket)
+                    delay(3.seconds)
+                    sendDelayedInitPackets(connectedSocket)
+                },
+                read = { connectedSocket ->
+                    readPackets(
+                        connectedSocket.inputStream,
+                        { connectedSocket.isConnected },
+                        ::processPacket,
+                        { Log.e(TAG, "Error processing received packet", it) }
+                    )
+                },
+                onConnected = onConnected,
+                onDisconnected = {
+                    onDisconnected()
+                    clearConnectionState()
                 }
-            }
-        } ?: run {
-            Log.e(TAG, "socket is null after creation")
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "failed to connect", e)
+            false
         }
-        return true
     }
 
     fun sendRawPacket(data: ByteArray): Boolean {
@@ -1028,14 +1005,10 @@ class AACPManager(private val device: AppleDevice) {
         sendPacket(packet)
     }
 
-    fun disconnect() {
-        try {
-            socket?.close()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error closing socket", e)
-        }
+    fun disconnect() = session.close()
+
+    private fun clearConnectionState() {
         Log.i(TAG, "disconnected")
-        socket = null
         device.updateState {
             it.copy(
                 battery = it.battery.map { battery ->

@@ -227,6 +227,9 @@ class IslandWindow(
             setupComposeView()
         }
 
+        // Measure the first window using its actual target state, not CLOSE/wrap_content.
+        islandState = forcedState ?: if (appSettings.islandSettings.enableExpanded) IslandState.EXPANDED else IslandState.COMPACT
+
         if (composeView?.parent == null) {
             val params = createLayoutParams(islandState)
             try {
@@ -236,9 +239,9 @@ class IslandWindow(
             } catch (e: Exception) {
                 Log.e("IslandWindow", "Error adding overlay view: $e")
             }
+        } else {
+            updateWindowParams(islandState)
         }
-
-        islandState = forcedState?: if (appSettings.islandSettings.enableExpanded) IslandState.EXPANDED else IslandState.COMPACT
 
         if (!keepOpen) resetTimer()
     }
