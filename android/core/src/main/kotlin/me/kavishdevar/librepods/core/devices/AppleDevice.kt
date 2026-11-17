@@ -9,6 +9,8 @@ import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -117,6 +119,8 @@ class AppleDevice(
         _microphoneFrames.emit(frame)
     }
 
+    private val connectionScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     val aacp = AACPManager(this)
     val att = ATTManager(this)
 
@@ -138,14 +142,17 @@ class AppleDevice(
         }
     }
 
+    @Synchronized
     override fun connect(): Boolean {
+        if (connectionState.value == ConnectionState.CONNECTED || connectionState.value == ConnectionState.CONNECTING) return true
+        connectionScope.coroutineContext.cancelChildren()
         _connectionState.update {
             ConnectionState.CONNECTING
         }
 
         val success = aacp.connect() // && att.connect()
 
-        CoroutineScope(Dispatchers.IO).launch {
+        if (success) connectionScope.launch {
             _state.update {
                 it.copy(
                     loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
@@ -165,19 +172,17 @@ class AppleDevice(
         return success
     }
 
-    override fun disconnect() {
-        _state.update {
-            it.copy(
-                lastDisconnected = System.currentTimeMillis()
-            )
-        }
-        _connectionState.update {
-            ConnectionState.DISCONNECTING
-        }
-
+    @Synchronized
+    fun closeControlConnection() {
+        connectionScope.coroutineContext.cancelChildren()
+        gestureDetector.stopDetection()
+        _state.update { it.copy(lastDisconnected = System.currentTimeMillis()) }
         aacp.disconnect()
-//        att.disconnect()
+        _connectionState.value = ConnectionState.DISCONNECTED
+    }
 
+    override fun disconnect() {
+        closeControlConnection()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.CINNAMON_BUN) {
             try {
                 bluetoothDevice.disconnect()
@@ -210,7 +215,7 @@ class AppleDevice(
 
     // can't use att notifications; keeping ATT connected causes airpods to disconnect every few seconds for some reason
     // we will poll the characteristic every 1 seconds instead.
-    fun observeATTCharacteristic(handle: ATTHandle): Job = CoroutineScope(Dispatchers.IO).launch {
+    fun observeATTCharacteristic(handle: ATTHandle): Job = connectionScope.launch {
         while (true) {
             val value = readATTCharacteristic(handle)
             if (value != null) {
