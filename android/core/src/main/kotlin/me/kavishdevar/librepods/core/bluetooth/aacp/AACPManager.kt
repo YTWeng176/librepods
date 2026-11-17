@@ -58,7 +58,6 @@ import me.kavishdevar.librepods.core.data.heartrate.HeartRateSample
 import me.kavishdevar.librepods.core.devices.AppleDevice
 import me.kavishdevar.librepods.core.devices.BatterySource
 import me.kavishdevar.librepods.core.devices.BatteryStatus
-import me.kavishdevar.librepods.core.devices.ConnectionState
 import me.kavishdevar.librepods.core.devices.DeviceComponent
 import me.kavishdevar.librepods.core.devices.hasSameBatteryState
 import me.kavishdevar.librepods.core.utils.HeadTracking
@@ -100,11 +99,11 @@ class AACPManager(private val device: AppleDevice) {
         }
     }
 
-    @Synchronized
-    fun connect(): Boolean {
+    fun connect(onConnecting: () -> Unit, onConnected: () -> Unit, onDisconnected: () -> Unit): Boolean {
         return try {
             session.connect(
                 create = {
+                    onConnecting()
                     val opened = device.createSocket(ParcelUuid.fromString("74ec2172-0bad-4d01-8f77-997b2be0722a"), 4097)
                     try {
                         opened.connect()
@@ -120,26 +119,21 @@ class AACPManager(private val device: AppleDevice) {
                     sendDelayedInitPackets(connectedSocket)
                 },
                 read = { connectedSocket ->
-                    try {
-                        readPackets(
-                            connectedSocket.inputStream,
-                            { connectedSocket.isConnected },
-                            ::processPacket,
-                            { Log.e(TAG, "Error processing received packet", it) }
-                        )
-                    } finally {
-                        synchronized(this@AACPManager) {
-                            if (socket === connectedSocket) {
-                                disconnect()
-                                device.updateConnectionState(ConnectionState.DISCONNECTED)
-                            }
-                        }
-                    }
+                    readPackets(
+                        connectedSocket.inputStream,
+                        { connectedSocket.isConnected },
+                        ::processPacket,
+                        { Log.e(TAG, "Error processing received packet", it) }
+                    )
+                },
+                onConnected = onConnected,
+                onDisconnected = {
+                    onDisconnected()
+                    clearConnectionState()
                 }
             )
         } catch (e: Exception) {
             Log.e(TAG, "failed to connect", e)
-            session.close()
             false
         }
     }
@@ -1011,9 +1005,9 @@ class AACPManager(private val device: AppleDevice) {
         sendPacket(packet)
     }
 
-    @Synchronized
-    fun disconnect() {
-        session.close()
+    fun disconnect() = session.close()
+
+    private fun clearConnectionState() {
         Log.i(TAG, "disconnected")
         device.updateState {
             it.copy(

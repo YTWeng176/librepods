@@ -1378,6 +1378,11 @@ class LibrePodsService: Service() {
         val old = earPresenceOf(previousComponentState)
         val new = earPresenceOf(newComponentState)
         if (old == new) return
+        // BLE can report wearing changes while another host owns the AirPods.
+        // Only local audio or our own temporary audio release permits side effects.
+        if (!audioLifecycle.allowsComponentSideEffects(
+                device.macAddress, device.connectionState.value == ConnectionState.CONNECTED
+            )) return
 
         Log.d(TAG, "earPresence: $old -> $new")
 

@@ -142,44 +142,35 @@ class AppleDevice(
         }
     }
 
-    @Synchronized
-    override fun connect(): Boolean {
-        if (connectionState.value == ConnectionState.CONNECTED || connectionState.value == ConnectionState.CONNECTING) return true
-        connectionScope.coroutineContext.cancelChildren()
-        _connectionState.update {
-            ConnectionState.CONNECTING
-        }
-
-        val success = aacp.connect() // && att.connect()
-
-        if (success) connectionScope.launch {
-            _state.update {
-                it.copy(
-                    loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
-                    transparencyData = readATTCharacteristic(ATTHandle.TRANSPARENCY)?: byteArrayOf(),
-                    hearingAidData = readATTCharacteristic(ATTHandle.HEARING_AID)?: byteArrayOf()
-                )
+    override fun connect(): Boolean = aacp.connect(
+        onConnecting = {
+            connectionScope.coroutineContext.cancelChildren()
+            _connectionState.value = ConnectionState.CONNECTING
+        },
+        onConnected = {
+            _connectionState.value = ConnectionState.CONNECTED
+            _connectionNumber.update { it + 1 }
+            connectionScope.launch {
+                _state.update {
+                    it.copy(
+                        loudSoundReductionEnabled = readATTCharacteristic(ATTHandle.LOUD_SOUND_REDUCTION)?.getOrNull(0)?.toInt() == 1,
+                        transparencyData = readATTCharacteristic(ATTHandle.TRANSPARENCY) ?: byteArrayOf(),
+                        hearingAidData = readATTCharacteristic(ATTHandle.HEARING_AID) ?: byteArrayOf()
+                    )
+                }
             }
+        },
+        onDisconnected = {
+            // Called only by the current socket's owner, including EOF and open
+            // failure. Never acquire a second device monitor from this callback.
+            connectionScope.coroutineContext.cancelChildren()
+            gestureDetector.stopDetection()
+            _state.update { it.copy(lastDisconnected = System.currentTimeMillis()) }
+            _connectionState.value = ConnectionState.DISCONNECTED
         }
+    )
 
-        _connectionState.update {
-            if (success) ConnectionState.CONNECTED else ConnectionState.DISCONNECTED
-        }
-        _connectionNumber.update {
-            it + 1
-        }
-
-        return success
-    }
-
-    @Synchronized
-    fun closeControlConnection() {
-        connectionScope.coroutineContext.cancelChildren()
-        gestureDetector.stopDetection()
-        _state.update { it.copy(lastDisconnected = System.currentTimeMillis()) }
-        aacp.disconnect()
-        _connectionState.value = ConnectionState.DISCONNECTED
-    }
+    fun closeControlConnection() = aacp.disconnect()
 
     override fun disconnect() {
         closeControlConnection()
@@ -191,9 +182,6 @@ class AppleDevice(
             }
         }
 
-        _connectionState.update {
-            ConnectionState.DISCONNECTED
-        }
     }
 
     fun setControlCommand(identifier: ControlCommandIdentifier, value: ByteArray): Boolean = aacp.sendControlCommand(identifier.value, value)

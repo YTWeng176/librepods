@@ -44,20 +44,33 @@ internal class SocketSession<T : Closeable>(private val scope: CoroutineScope) {
         private set
     private var reader: Job? = null
     private var initializer: Job? = null
+    private var onClosed: (() -> Unit)? = null
 
     @Synchronized
-    fun connect(create: () -> T, initialize: suspend (T) -> Unit, read: suspend (T) -> Unit): Boolean {
+    fun connect(
+        create: () -> T, initialize: suspend (T) -> Unit, read: suspend (T) -> Unit,
+        onConnected: () -> Unit = {}, onDisconnected: () -> Unit = {}
+    ): Boolean {
         if (resource != null && reader?.isActive == true) return true
         close()
-        val opened = create()
-        resource = opened
-        initializer = scope.launch(start = CoroutineStart.LAZY) { initialize(opened) }
-        reader = scope.launch(start = CoroutineStart.LAZY) {
-            try { read(opened) } finally { closeIfCurrent(opened) }
+        onClosed = onDisconnected
+        try {
+            val opened = create()
+            resource = opened
+            initializer = scope.launch(start = CoroutineStart.LAZY) { initialize(opened) }
+            reader = scope.launch(start = CoroutineStart.LAZY) {
+                try { read(opened) } finally { closeIfCurrent(opened) }
+            }
+            // Publish success under the same owner as termination, before either
+            // job can finish. An immediate EOF must never be overwritten by success.
+            onConnected()
+            initializer?.start()
+            reader?.start()
+            return resource === opened && reader?.isActive == true
+        } catch (e: Exception) {
+            close()
+            throw e
         }
-        initializer?.start()
-        reader?.start()
-        return true
     }
 
     @Synchronized private fun closeIfCurrent(opened: T) {
@@ -66,12 +79,20 @@ internal class SocketSession<T : Closeable>(private val scope: CoroutineScope) {
 
     @Synchronized fun close() {
         val opened = resource
-        resource = null
-        initializer?.cancel()
-        initializer = null
-        reader?.cancel()
-        reader = null
-        try { opened?.close() } catch (_: IOException) { /* Already disconnected. */ }
+        val notify = onClosed
+        onClosed = null
+        try {
+            // Device state and device-owned jobs share this connection owner.
+            // No separate manager/device monitor is acquired by the callback.
+            notify?.invoke()
+        } finally {
+            resource = null
+            initializer?.cancel()
+            initializer = null
+            reader?.cancel()
+            reader = null
+            try { opened?.close() } catch (_: IOException) { /* Already disconnected. */ }
+        }
     }
 }
 
@@ -175,6 +196,11 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
         val state = devices.getOrPut(key) { State() }
         state.retained = retain
         if (retain) { state.pending?.cancel(); state.pending = null }
+    }
+
+    @Synchronized fun allowsComponentSideEffects(key: K, controlConnected: Boolean): Boolean {
+        val state = devices[key] ?: return false
+        return controlConnected && (state.connected.isNotEmpty() || state.retained)
     }
 
     @Synchronized fun disconnected(key: K) { devices.remove(key)?.pending?.cancel() }
