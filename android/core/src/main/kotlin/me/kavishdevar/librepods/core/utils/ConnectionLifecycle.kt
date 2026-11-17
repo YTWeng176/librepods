@@ -184,13 +184,13 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
             state.connected.add(profile)
             state.disconnecting = false
         } else state.connected.remove(profile)
-        if (state.connected.isNotEmpty() || state.retained) return
+        if (state.retained || (state.connected.isNotEmpty() && !state.disconnecting)) return
         state.pending = scope.launch {
             delay(3_000)
             synchronized(this@AudioConnectionLifecycle) {
-                if (devices[key] === state && state.connected.isEmpty() && !state.retained) {
+                if (devices[key] === state && !state.retained) {
                     state.pending = null
-                    close(key)
+                    if (state.connected.isEmpty()) close(key) else state.disconnecting = false
                 }
             }
         }
@@ -199,7 +199,10 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
     @Synchronized fun beginDisconnect(key: K) {
         // One profile beginning a system disconnect revokes ordinary wearing
         // effects for the whole device, even while another profile is still up.
-        devices.getOrPut(key) { State() }.disconnecting = true
+        val state = devices.getOrPut(key) { State() }
+        state.pending?.cancel()
+        state.pending = null
+        state.disconnecting = true
     }
 
     @Synchronized fun retainForEarDetection(key: K, retain: Boolean) {

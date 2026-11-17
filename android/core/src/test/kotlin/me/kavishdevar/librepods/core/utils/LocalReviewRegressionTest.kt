@@ -178,4 +178,39 @@ class LocalReviewRegressionTest {
         assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
     }
 
+    @Test fun headsetOnlyDisconnectRestoresWearingAfterStableGrace() = runTest {
+        var closed = false
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) { closed = true }
+        audio.update("buds", 2, true)
+        audio.update("buds", 1, true)
+        audio.beginDisconnect("buds")
+        audio.update("buds", 1, false)
+        advanceTimeBy(2_999); runCurrent()
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        advanceTimeBy(1); runCurrent()
+        assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        assertFalse(closed)
+    }
+
+    @Test fun nextProfileDisconnectingCancelsPreviousGraceUntilItDisconnects() = runTest {
+        var closed = false
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) { closed = true }
+        audio.update("buds", 2, true)
+        audio.update("buds", 1, true)
+        audio.beginDisconnect("buds")
+        audio.update("buds", 1, false)
+        advanceTimeBy(2_000); runCurrent()
+        audio.beginDisconnect("buds")
+        // A2DP is now disconnecting. The first grace must not restore permission
+        // while waiting for its final DISCONNECTED broadcast.
+        advanceTimeBy(2_000); runCurrent()
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        assertFalse(closed)
+        audio.update("buds", 2, false)
+        advanceTimeBy(2_999); runCurrent()
+        assertFalse(closed)
+        advanceTimeBy(1); runCurrent()
+        assertTrue(closed)
+    }
+
 }
