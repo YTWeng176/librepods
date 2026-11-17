@@ -485,7 +485,11 @@ class LibrePodsService: Service() {
                 audioLifecycle.update(mac, profile, true)
                 if (state == BluetoothProfile.STATE_CONNECTED) onDeviceConnected(device, audioConfirmed = true)
             }
-            BluetoothProfile.STATE_DISCONNECTED -> audioLifecycle.update(mac, profile, false)
+            BluetoothProfile.STATE_DISCONNECTING -> audioLifecycle.beginDisconnect(mac)
+            BluetoothProfile.STATE_DISCONNECTED -> {
+                audioLifecycle.beginDisconnect(mac)
+                audioLifecycle.update(mac, profile, false)
+            }
         }
     }
 

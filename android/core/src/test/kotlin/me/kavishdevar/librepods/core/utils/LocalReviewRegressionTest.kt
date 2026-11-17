@@ -127,4 +127,55 @@ class LocalReviewRegressionTest {
         assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = false))
         assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
     }
+    @Test fun lastProfileDisconnectingRevokesPermissionBeforeDisconnected() = runTest {
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) {}
+        audio.update("buds", 2, true)
+        assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        audio.beginDisconnect("buds")
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        audio.update("buds", 2, false)
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+    }
+
+    @Test fun remainingHeadsetProfileCannotPermitWearingDuringSystemDisconnect() = runTest {
+        var released = false
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) { released = true }
+        audio.update("buds", 2, true)
+        audio.update("buds", 1, true)
+        audio.beginDisconnect("buds")
+        audio.update("buds", 2, false)
+        // A2DP is gone but HFP has not reported its disconnect yet. NONE/IN_EAR
+        // must neither restore audio nor create a new App-owned retain permit.
+        val permitted = audio.allowsComponentSideEffects("buds", controlConnected = true)
+        if (permitted) audio.retainForEarDetection("buds", true)
+        audio.update("buds", 1, false)
+        advanceTimeBy(3_000); runCurrent()
+        assertFalse(permitted)
+        assertTrue(released)
+    }
+
+    @Test fun priorAppOwnedReleaseSurvivesDisconnectingProfiles() = runTest {
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) {}
+        audio.update("buds", 2, true)
+        audio.retainForEarDetection("buds", true)
+        audio.beginDisconnect("buds")
+        assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        audio.update("buds", 2, false)
+        assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        audio.retainForEarDetection("buds", false)
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+    }
+
+    @Test fun newConnectingProfileRestoresOrdinaryWearingPermission() = runTest {
+        val audio = AudioConnectionLifecycle<String>(backgroundScope) {}
+        audio.update("buds", 2, true)
+        audio.update("buds", 1, true)
+        audio.beginDisconnect("buds")
+        audio.update("buds", 2, false)
+        assertFalse(audio.allowsComponentSideEffects("buds", controlConnected = true))
+        // Service passes both CONNECTING and CONNECTED as an active profile.
+        audio.update("buds", 2, true)
+        assertTrue(audio.allowsComponentSideEffects("buds", controlConnected = true))
+    }
+
 }

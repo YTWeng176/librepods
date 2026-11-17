@@ -171,6 +171,7 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
     private class State {
         val connected = mutableSetOf<Int>()
         var retained = false
+        var disconnecting = false
         var pending: Job? = null
     }
     private val devices = mutableMapOf<K, State>()
@@ -179,7 +180,10 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
         val state = devices.getOrPut(key) { State() }
         state.pending?.cancel()
         state.pending = null
-        if (connected) state.connected.add(profile) else state.connected.remove(profile)
+        if (connected) {
+            state.connected.add(profile)
+            state.disconnecting = false
+        } else state.connected.remove(profile)
         if (state.connected.isNotEmpty() || state.retained) return
         state.pending = scope.launch {
             delay(3_000)
@@ -192,6 +196,12 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
         }
     }
 
+    @Synchronized fun beginDisconnect(key: K) {
+        // One profile beginning a system disconnect revokes ordinary wearing
+        // effects for the whole device, even while another profile is still up.
+        devices.getOrPut(key) { State() }.disconnecting = true
+    }
+
     @Synchronized fun retainForEarDetection(key: K, retain: Boolean) {
         val state = devices.getOrPut(key) { State() }
         state.retained = retain
@@ -200,7 +210,7 @@ class AudioConnectionLifecycle<K>(private val scope: CoroutineScope, private val
 
     @Synchronized fun allowsComponentSideEffects(key: K, controlConnected: Boolean): Boolean {
         val state = devices[key] ?: return false
-        return controlConnected && (state.connected.isNotEmpty() || state.retained)
+        return controlConnected && (state.retained || (!state.disconnecting && state.connected.isNotEmpty()))
     }
 
     @Synchronized fun disconnected(key: K) { devices.remove(key)?.pending?.cancel() }
